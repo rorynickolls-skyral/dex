@@ -53,6 +53,9 @@ type Config struct {
 	// If this field is nonempty, only users from a listed group will be allowed to log in
 	Groups []string `json:"groups"`
 
+	// Optionally get additional claims from the upstream userInfo endpoint
+	GetUserInfo bool `json:"getUserInfo"`
+
 	// Optional path to service account json
 	// If nonempty, and groups claim is made, will use authentication from file to
 	// check groups with the admin directory api
@@ -143,6 +146,7 @@ func (c *Config) Open(id string, logger *slog.Logger) (conn connector.Connector,
 		cancel:                         cancel,
 		hostedDomains:                  c.HostedDomains,
 		groups:                         c.Groups,
+		getUserInfo:                    c.GetUserInfo,
 		serviceAccountFilePath:         c.ServiceAccountFilePath,
 		domainToAdminEmail:             c.DomainToAdminEmail,
 		fetchTransitiveGroupMembership: c.FetchTransitiveGroupMembership,
@@ -164,6 +168,7 @@ type googleConnector struct {
 	logger                         *slog.Logger
 	hostedDomains                  []string
 	groups                         []string
+	getUserInfo                    bool
 	serviceAccountFilePath         string
 	domainToAdminEmail             map[string]string
 	fetchTransitiveGroupMembership bool
@@ -252,8 +257,8 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 		Subject       string `json:"sub"`
 		Username      string `json:"name"`
 		Email         string `json:"email"`
-		EmailVerified bool   `json:"email_verified"`
 		HostedDomain  string `json:"hd"`
+		EmailVerified bool   `json:"email_verified"`
 	}
 
 	if rawIDToken, ok := token.Extra("id_token").(string); ok {
@@ -277,10 +282,9 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 				return identity, fmt.Errorf("oidc: failed to decode claims: %v", err)
 			}
 		case "urn:ietf:params:oauth:token-type:access_token":
-			// relies on getUserInfo to verify token and populate claims
-			// if !c.getUserInfo {
-			// 	return identity, fmt.Errorf("oidc: getUserInfo is required for access token exchange")
-			// }
+			if !c.getUserInfo {
+				return identity, fmt.Errorf("google: getUserInfo is required for access token exchange")
+			}
 		default:
 			return identity, fmt.Errorf("unknown token type for token exchange: %s", token.TokenType)
 		}
@@ -288,13 +292,15 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 		return identity, errors.New("google: no id_token in token response")
 	}
 
-	userInfo, err := c.getUserInfo(ctx, token)
-	if err != nil {
-		return identity, fmt.Errorf("google: failed to get userinfo claims: %v", err)
-	}
+	if c.getUserInfo {
+		userInfo, err := c.getOIDCUserInfo(ctx, token)
+		if err != nil {
+			return identity, fmt.Errorf("google: failed to get userinfo claims: %v", err)
+		}
 
-	if err := userInfo.Claims(&claims); err != nil {
-		return identity, fmt.Errorf("google: failed to decode userinfo claims: %v", err)
+		if err := userInfo.Claims(&claims); err != nil {
+			return identity, fmt.Errorf("google: failed to decode userinfo claims: %v", err)
+		}
 	}
 
 	if len(c.hostedDomains) > 0 {
@@ -314,7 +320,7 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 	var groups []string
 	if s.Groups && len(c.adminSrv) > 0 {
 		checkedGroups := make(map[string]struct{})
-		groups, err = c.getGroups(claims.Email, c.fetchTransitiveGroupMembership, checkedGroups)
+		groups, err := c.getGroups(claims.Email, c.fetchTransitiveGroupMembership, checkedGroups)
 		if err != nil {
 			return identity, fmt.Errorf("google: could not retrieve groups: %v", err)
 		}
@@ -339,7 +345,7 @@ func (c *googleConnector) createIdentity(ctx context.Context, identity connector
 }
 
 // getUserInfo retrieves userInfo claims from Google using the standard OIDC userInfo endpoint
-func (c *googleConnector) getUserInfo(ctx context.Context, token *oauth2.Token) (*oidc.UserInfo, error) {
+func (c *googleConnector) getOIDCUserInfo(ctx context.Context, token *oauth2.Token) (*oidc.UserInfo, error) {
 	oidcProvider, err := oidc.NewProvider(ctx, issuerURL)
 	if err != nil {
 		return nil, errors.New("google: failed to get oidc provider")
